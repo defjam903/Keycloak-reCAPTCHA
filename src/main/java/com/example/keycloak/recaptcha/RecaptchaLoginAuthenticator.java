@@ -8,13 +8,14 @@ import org.keycloak.authentication.AuthenticationFlowError;
 import org.keycloak.authentication.authenticators.browser.UsernamePasswordForm;
 import org.keycloak.forms.login.LoginFormsProvider;
 
-import java.io.BufferedReader;
-import java.io.DataOutputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.io.IOException;
+import java.net.URI;
 import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 /**
  * Keycloak reCAPTCHA Login Authenticator
@@ -39,6 +40,23 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
 
     /** Minimum score to accept for reCAPTCHA v3 (unused in v2, kept for future use). */
     private static final double MIN_SCORE = 0.5;
+
+    /** Maximum number of attempts to reach Google's API (1 initial + 2 retries). */
+    private static final int MAX_ATTEMPTS = 3;
+
+    /** Base delay in milliseconds for exponential back-off between retries. */
+    private static final long RETRY_BASE_DELAY_MS = 300;
+
+    /**
+     * Shared, thread-safe {@link HttpClient} with built-in connection pooling.
+     * A single instance is reused across all login requests.
+     * Redirects are disabled — Google's siteverify endpoint should never redirect,
+     * and following redirects to an unexpected host would be a security risk.
+     */
+    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .build();
 
     // -----------------------------------------------------------------------
     // Core flow entry points
@@ -106,7 +124,9 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
     // -----------------------------------------------------------------------
 
     /**
-     * Calls Google's siteverify API and returns {@code true} if the token is valid.
+     * Calls Google's siteverify API with up to {@value MAX_ATTEMPTS} attempts.
+     * Transient failures (network errors, HTTP 5xx) are retried with exponential
+     * back-off. Permanent failures (HTTP 4xx) are not retried.
      *
      * @param token     the {@code g-recaptcha-response} value from the form
      * @param secretKey the configured reCAPTCHA secret key
@@ -114,57 +134,92 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
      * @return {@code true} on successful verification
      */
     private boolean verifyRecaptchaToken(String token, String secretKey, AuthenticationFlowContext context) {
-        try {
-            // Build POST body
-            String postData = "secret=" + URLEncoder.encode(secretKey, StandardCharsets.UTF_8)
-                    + "&response=" + URLEncoder.encode(token, StandardCharsets.UTF_8);
+        String postBody = buildPostBody(token, secretKey, context);
+        HttpRequest request = buildHttpRequest(postBody);
 
-            // Optionally include the user's remote IP for additional Google-side signals
-            String remoteAddr = context.getConnection().getRemoteAddr();
-            if (remoteAddr != null && !remoteAddr.isBlank()) {
-                postData += "&remoteip=" + URLEncoder.encode(remoteAddr, StandardCharsets.UTF_8);
-            }
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                HttpResponse<String> response =
+                        HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
 
-            // Execute the HTTP POST
-            URL url = new URL(GOOGLE_VERIFY_URL);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(5_000);
-            conn.setReadTimeout(5_000);
-            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-            conn.setRequestProperty("Content-Length", String.valueOf(postData.length()));
-
-            try (DataOutputStream out = new DataOutputStream(conn.getOutputStream())) {
-                out.writeBytes(postData);
-                out.flush();
-            }
-
-            int status = conn.getResponseCode();
-            if (status != 200) {
-                logger.errorf("[reCAPTCHA] Google API returned HTTP %d", status);
-                return false;
-            }
-
-            // Read response body
-            StringBuilder responseBody = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    responseBody.append(line);
+                int status = response.statusCode();
+                if (status == 200) {
+                    String body = response.body();
+                    logger.debugf("[reCAPTCHA] Siteverify response (attempt %d): %s", attempt, body);
+                    return parseSuccess(body);
                 }
+
+                // 4xx = permanent failure (bad request / unauthorized) — do not retry
+                if (status >= 400 && status < 500) {
+                    logger.errorf("[reCAPTCHA] Google API returned HTTP %d — not retrying", status);
+                    return false;
+                }
+
+                // 5xx = transient server-side error — fall through to retry logic below
+                logger.warnf("[reCAPTCHA] Google API returned HTTP %d on attempt %d/%d",
+                        status, attempt, MAX_ATTEMPTS);
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.error("[reCAPTCHA] Thread interrupted during token verification");
+                return false;
+            } catch (IOException e) {
+                // Network/IO error — transient, fall through to retry
+                logger.warnf(e, "[reCAPTCHA] Network error on attempt %d/%d", attempt, MAX_ATTEMPTS);
             }
 
-            String body = responseBody.toString();
-            logger.debugf("[reCAPTCHA] Siteverify response: %s", body);
+            if (attempt < MAX_ATTEMPTS) {
+                sleepBeforeRetry(attempt);
+            }
+        }
 
-            // Parse "success": true/false without pulling in a JSON library
-            return parseSuccess(body);
+        logger.errorf("[reCAPTCHA] All %d attempts to verify token failed", MAX_ATTEMPTS);
+        return false;
+    }
 
-        } catch (Exception e) {
-            logger.errorf(e, "[reCAPTCHA] Exception during token verification");
-            return false;
+    /**
+     * Builds the URL-encoded POST body for the siteverify request.
+     * Using {@link URLEncoder#encode(String, java.nio.charset.Charset)} ensures
+     * correct byte-level encoding — the body publisher below measures byte length,
+     * not character length, so {@code Content-Length} will always be accurate.
+     */
+    private String buildPostBody(String token, String secretKey, AuthenticationFlowContext context) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("secret=").append(URLEncoder.encode(secretKey, StandardCharsets.UTF_8));
+        sb.append("&response=").append(URLEncoder.encode(token, StandardCharsets.UTF_8));
+
+        // Optionally include the user's remote IP for additional Google-side signals
+        String remoteAddr = context.getConnection().getRemoteAddr();
+        if (remoteAddr != null && !remoteAddr.isBlank()) {
+            sb.append("&remoteip=").append(URLEncoder.encode(remoteAddr, StandardCharsets.UTF_8));
+        }
+
+        return sb.toString();
+    }
+
+    /**
+     * Builds an immutable {@link HttpRequest}. Because the body is constant across
+     * retry attempts, the same request object is reused for all attempts.
+     * {@link HttpRequest.BodyPublishers#ofString} encodes to UTF-8 bytes and sets
+     * {@code Content-Length} to the correct byte count (fixing the character-count
+     * bug present in the previous {@code DataOutputStream.writeBytes} approach).
+     */
+    private HttpRequest buildHttpRequest(String postBody) {
+        return HttpRequest.newBuilder()
+                .uri(URI.create(GOOGLE_VERIFY_URL))
+                .timeout(Duration.ofSeconds(5))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(postBody, StandardCharsets.UTF_8))
+                .build();
+    }
+
+    /** Sleeps for {@code RETRY_BASE_DELAY_MS * 2^(attempt-1)} ms (300 ms, then 600 ms). */
+    private void sleepBeforeRetry(int attempt) {
+        long delayMs = RETRY_BASE_DELAY_MS * (1L << (attempt - 1));
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
 
