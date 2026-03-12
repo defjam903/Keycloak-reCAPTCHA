@@ -69,6 +69,15 @@
             <version>3.1.0</version>
             <scope>provided</scope>
         </dependency>
+
+        <!-- Apache HttpClient — provided by Keycloak's runtime (via HttpClientProvider SPI).
+             Listed here only for compilation; must not be bundled in the plugin JAR. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpclient</artifactId>
+            <version>4.5.14</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -101,6 +110,7 @@
                                     <exclude>org.keycloak:*</exclude>
                                     <exclude>org.jboss.logging:*</exclude>
                                     <exclude>jakarta.ws.rs:*</exclude>
+                                    <exclude>org.apache.httpcomponents:*</exclude>
                                 </excludes>
                             </artifactSet>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
