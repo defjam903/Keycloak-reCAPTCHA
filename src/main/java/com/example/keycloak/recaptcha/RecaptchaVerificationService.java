@@ -73,13 +73,26 @@ class RecaptchaVerificationService {
                     int status = response.getStatusLine().getStatusCode();
 
                     if (status == 200) {
-                        String body = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
-                        logger.debugf("[reCAPTCHA] Siteverify response (attempt %d): %s", attempt, body);
-                        boolean success = parseSuccess(body);
-                        if (!success) {
-                            logVerificationFailure(body);
+                        String body = null;
+                        try {
+                            body = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                            logger.debugf("[reCAPTCHA] Siteverify response (attempt %d): %s", attempt, body);
+                            boolean success = parseSuccess(body);
+                            if (!success) {
+                                logVerificationFailure(body);
+                            }
+                            return success;
+                        } catch (Exception e) {
+                            // Catches unexpected runtime exceptions from body reading or parsing
+                            // (e.g. org.apache.http.ParseException, which is a RuntimeException
+                            // not covered by the IOException handler below).
+                            // body may be null if EntityUtils.toString itself threw.
+                            logger.errorf(e,
+                                    "[reCAPTCHA] Failed to process siteverify response — %s.%s",
+                                    e.getMessage(),
+                                    body != null ? " Raw response: " + body : " (response body could not be read)");
+                            return false;
                         }
-                        return success;
                     }
 
                     // Consume entity so the connection is returned to the pool cleanly
