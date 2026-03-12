@@ -16,6 +16,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * Keycloak reCAPTCHA Login Authenticator
@@ -146,7 +149,11 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
                 if (status == 200) {
                     String body = response.body();
                     logger.debugf("[reCAPTCHA] Siteverify response (attempt %d): %s", attempt, body);
-                    return parseSuccess(body);
+                    boolean success = parseSuccess(body);
+                    if (!success) {
+                        logVerificationFailure(body);
+                    }
+                    return success;
                 }
 
                 // 4xx = permanent failure (bad request / unauthorized) — do not retry
@@ -229,9 +236,95 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
      */
     static boolean parseSuccess(String json) {
         if (json == null) return false;
-        // Normalize and search for the success field
         String normalized = json.replaceAll("\\s", "");
         return normalized.contains("\"success\":true");
+    }
+
+    /**
+     * Logs a detailed, actionable message when Google returns {@code "success":false}.
+     *
+     * <p>Three distinct cases are handled:
+     * <ol>
+     *   <li>The {@code success} field is absent entirely — likely an API format change.</li>
+     *   <li>Google returns {@code error-codes} — each code is logged at the appropriate
+     *       level: {@code ERROR} for configuration errors that require admin action,
+     *       {@code WARN} for user-side failures that are expected in normal operation.</li>
+     *   <li>{@code success:false} is present but no {@code error-codes} are included —
+     *       the raw body is logged for manual inspection.</li>
+     * </ol>
+     */
+    private void logVerificationFailure(String responseBody) {
+        String normalized = responseBody == null ? "" : responseBody.replaceAll("\\s", "");
+
+        if (!normalized.contains("\"success\":")) {
+            logger.errorf("[reCAPTCHA] Unexpected response format from Google — 'success' field missing. "
+                    + "Google may have changed their API. Raw response: %s", responseBody);
+            return;
+        }
+
+        List<String> errorCodes = extractErrorCodes(responseBody);
+        if (errorCodes.isEmpty()) {
+            logger.warnf("[reCAPTCHA] Verification returned success:false with no error-codes. "
+                    + "Raw response: %s", responseBody);
+            return;
+        }
+
+        for (String code : errorCodes) {
+            switch (code) {
+                case "missing-input-secret":
+                case "invalid-input-secret":
+                    logger.errorf("[reCAPTCHA] Configuration error — error-code: '%s'. "
+                            + "Check the reCAPTCHA secret key in the Keycloak Admin Console.", code);
+                    break;
+                case "timeout-or-duplicate":
+                    logger.warnf("[reCAPTCHA] Token rejected — error-code: '%s'. "
+                            + "The token has expired or was already used; the user should retry.", code);
+                    break;
+                case "missing-input-response":
+                case "invalid-input-response":
+                    logger.warnf("[reCAPTCHA] Token invalid — error-code: '%s'. "
+                            + "The user's reCAPTCHA response was missing or malformed.", code);
+                    break;
+                case "bad-request":
+                    logger.errorf("[reCAPTCHA] Bad request — error-code: '%s'. "
+                            + "The siteverify request itself was malformed; check plugin code.", code);
+                    break;
+                default:
+                    logger.warnf("[reCAPTCHA] Verification failed — unrecognised error-code: '%s'. "
+                            + "Google may have introduced a new error code.", code);
+            }
+        }
+    }
+
+    /**
+     * Extracts the string values from Google's {@code error-codes} JSON array.
+     * Returns an empty list if the field is absent or the array is empty.
+     *
+     * <p>Example input: {@code {"success":false,"error-codes":["invalid-input-response"]}}</p>
+     */
+    static List<String> extractErrorCodes(String json) {
+        if (json == null) return Collections.emptyList();
+        String normalized = json.replaceAll("\\s", "");
+
+        int keyIndex = normalized.indexOf("\"error-codes\":[");
+        if (keyIndex < 0) return Collections.emptyList();
+
+        int arrayStart = normalized.indexOf('[', keyIndex);
+        int arrayEnd   = normalized.indexOf(']', arrayStart);
+        if (arrayStart < 0 || arrayEnd <= arrayStart) return Collections.emptyList();
+
+        String arrayContent = normalized.substring(arrayStart + 1, arrayEnd);
+        if (arrayContent.isEmpty()) return Collections.emptyList();
+
+        List<String> codes = new ArrayList<>();
+        for (String part : arrayContent.split(",")) {
+            // Strip surrounding quotes
+            String code = part.replaceAll("^\"|\"$", "").trim();
+            if (!code.isEmpty()) {
+                codes.add(code);
+            }
+        }
+        return codes;
     }
 
     // -----------------------------------------------------------------------
