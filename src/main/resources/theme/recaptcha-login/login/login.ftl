@@ -152,7 +152,7 @@
                  * token regardless of this check.
                  */
                 function validateRecaptchaAndSubmit() {
-                    var token = document.querySelector('.g-recaptcha-response');
+                    var token = document.querySelector('[name="g-recaptcha-response"]');
                     if (!token || !token.value) {
                         document.getElementById('recaptcha-error').style.display = 'block';
                         return false;
