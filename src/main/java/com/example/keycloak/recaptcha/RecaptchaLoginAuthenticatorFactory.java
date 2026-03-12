@@ -1,8 +1,10 @@
 package com.example.keycloak.recaptcha;
 
+import org.apache.http.impl.client.CloseableHttpClient;
 import org.keycloak.Config;
 import org.keycloak.authentication.Authenticator;
 import org.keycloak.authentication.AuthenticatorFactory;
+import org.keycloak.connections.httpclient.HttpClientProvider;
 import org.keycloak.models.AuthenticationExecutionModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
@@ -30,8 +32,6 @@ public class RecaptchaLoginAuthenticatorFactory implements AuthenticatorFactory 
     public static final String CONFIG_SITE_KEY   = "recaptcha.site.key";
     public static final String CONFIG_SECRET_KEY = "recaptcha.secret.key";
 
-    /** Singleton instance — Authenticators are stateless and safe to share. */
-    private static final RecaptchaLoginAuthenticator SINGLETON = new RecaptchaLoginAuthenticator();
 
     // -----------------------------------------------------------------------
     // ProviderFactory / AuthenticatorFactory implementation
@@ -89,9 +89,18 @@ public class RecaptchaLoginAuthenticatorFactory implements AuthenticatorFactory 
     // Authenticator creation
     // -----------------------------------------------------------------------
 
+    /**
+     * Creates a new {@link RecaptchaLoginAuthenticator} for the given session.
+     *
+     * <p>The {@link CloseableHttpClient} is obtained from Keycloak's
+     * {@link HttpClientProvider}, which manages connection pooling, TLS, and proxy
+     * settings centrally. Do <em>not</em> close the client — its lifecycle is owned
+     * by the Keycloak runtime.</p>
+     */
     @Override
     public Authenticator create(KeycloakSession session) {
-        return SINGLETON;
+        CloseableHttpClient httpClient = session.getProvider(HttpClientProvider.class).getHttpClient();
+        return new RecaptchaLoginAuthenticator(new RecaptchaVerificationService(httpClient));
     }
 
     @Override
