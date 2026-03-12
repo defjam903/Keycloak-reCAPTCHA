@@ -84,8 +84,14 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
 
         String secretKey = getSecretKey(context);
         if (secretKey == null || secretKey.isBlank()) {
-            logger.error("[reCAPTCHA] Secret key is not configured — cannot verify token");
-            context.failure(AuthenticationFlowError.INTERNAL_ERROR);
+            // UNAUTHORIZED_ACCESS rather than INTERNAL_ERROR: a missing secret key means the
+            // reCAPTCHA check cannot be performed at all, so the login must be denied outright.
+            // INTERNAL_ERROR would still block login, but its semantics imply a server fault
+            // rather than an explicit security gate, and some flow configurations treat it
+            // differently (e.g. retry logic). UNAUTHORIZED_ACCESS makes the intent unambiguous.
+            logger.error("[reCAPTCHA] Secret key is not configured — denying login. "
+                    + "Configure the reCAPTCHA secret key in the Keycloak Admin Console.");
+            context.failure(AuthenticationFlowError.UNAUTHORIZED_ACCESS);
             return;
         }
 
