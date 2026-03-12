@@ -91,7 +91,7 @@ public class RecaptchaLoginAuthenticator extends UsernamePasswordForm {
             // differently (e.g. retry logic). UNAUTHORIZED_ACCESS makes the intent unambiguous.
             logger.error("[reCAPTCHA] Secret key is not configured — denying login. "
                     + "Configure the reCAPTCHA secret key in the Keycloak Admin Console.");
-            context.failure(AuthenticationFlowError.UNAUTHORIZED_ACCESS);
+            context.failure(AuthenticationFlowError.ACCESS_DENIED);
             return;
         }
 
